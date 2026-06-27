@@ -151,8 +151,14 @@ def threaded_udp_relay(host_port, joiner_port, game_id, expected_ips):
 
     # The Watchdog Loop
     while game_id in STATE.games:
-        # If 30 seconds pass with zero packets, assume a crash/Alt-F4
-        if time.time() - last_active[0] > 30.0:
+        # If 600 seconds (10 min) pass with zero packets, assume a
+        # crash/Alt-F4. The earlier 30 s value triggered on perfectly
+        # healthy lobbies because an empty lobby (host waiting alone)
+        # sends literally no UDP traffic until a joiner shows up.
+        # At current community scale, port exhaustion from idle slots
+        # isn't a concern; revisit if active games regularly exceed
+        # the pool size.
+        if time.time() - last_active[0] > 600.0:
             print "[!] RELAY: Lobby {0} timed out (Crash/Alt-F4 detected).".format(game_id)
             if game_id in STATE.games:
                 del STATE.games[game_id] 
