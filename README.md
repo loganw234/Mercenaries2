@@ -149,6 +149,11 @@ and Localization.
 
 ## Acknowledgements
 
+- **u/Kunster_** on r/MercenariesGames for the
+  [post](https://www.reddit.com/r/MercenariesGames/) describing the
+  Lua registration-table patch technique — pointing this project at
+  hooking `luaL_register` to intercept `print` is what made Phase 2
+  possible.
 - **MinHook** by Tsuda Kageyu (BSD 2-Clause) — bundled in
   [Merc2Fix/include](Merc2Fix/include) and
   [Merc2Fix/src](Merc2Fix/src).
