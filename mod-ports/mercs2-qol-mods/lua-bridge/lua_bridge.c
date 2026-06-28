@@ -679,10 +679,29 @@ static __inline void GatedPump(void* L_arg0) {
 }
 
 static void CaptureL(void* L, const char* via) {
+    /* Fast path: same L as last capture — return without logging or
+     * touching the seen-set. This is the common case (every detour
+     * fire on the same VM). */
     if (!L || L == g_LuaState) return;
     if (!LooksLikeLuaState(L)) return;
     g_LuaState = L;
-    m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
+
+    /* Dedupe log spam: the engine flips between multiple Lua VMs
+     * (frontend + gameplay + occasional coroutines) on the same
+     * main thread, so g_LuaState legitimately changes many times
+     * per second. Log only the first time we observe each distinct
+     * L. 8 slots is enough for any realistic game state. */
+    static void* seen[8] = {0};
+    int i;
+    for (i = 0; i < 8; ++i) {
+        if (seen[i] == L) return;            /* already logged */
+        if (seen[i] == NULL) {
+            seen[i] = L;
+            m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
+            return;
+        }
+    }
+    /* seen[] full — silently update without logging. */
 }
 
 /* ------------------------------------------------------------------------ *

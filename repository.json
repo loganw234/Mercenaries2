@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "name": "Merc2Reborn",
+  "maintainer": "loganw234",
+  "url": "https://github.com/loganw234/Mercenaries2",
+  "description": "Online multiplayer revival (FESL emulation + UDP relay) and a Lua execution bridge for Mercenaries 2: World in Flames. Same release supports both the canonical archive.org retail binary and the mercs2-securom-bypass-patched form via runtime fingerprint detection.",
+  "mods": [
+    {
+      "slug": "merc2fix-full",
+      "name": "Merc2Fix (Multiplayer + Lua Bridge)",
+      "type": "asi",
+      "description": "Full build: restores online multiplayer (private FESL/Theater/GameSpy server at refesl.live, UDP relay so hosts don't need port forwarding) AND exposes the game's Lua 5.1.2 runtime via a localhost TCP REPL on 127.0.0.1:27050 for runtime modding. Auto-detects exe version; falls back safely with the Lua bridge disabled on unknown binaries (multiplayer keeps working). Ships with a desktop IDE for sending Lua chunks.",
+      "version": "1.2.0",
+      "assets": ["Merc2Fix.asi", "lua_console.exe"],
+      "tools": [
+        {
+          "id": "lua-console",
+          "name": "Lua Console",
+          "description": "Tabbed Lua IDE with syntax highlighting, persistent output panel, and live bridge status indicator. Double-click to launch.",
+          "executable": "lua_console.exe",
+          "requires": "Game must be running with this mod loaded; the IDE connects to the in-game bridge on 127.0.0.1:27050."
+        }
+      ]
+    },
+    {
+      "slug": "merc2fix-multiplayer-only",
+      "name": "Merc2Fix (Multiplayer Only)",
+      "type": "asi",
+      "description": "Lighter build with the Lua bridge compiled out entirely. Use this if you only want multiplayer or if the full build's Lua hooks ever cause trouble on your specific exe version. Multiplayer behaviour is identical to the full build.",
+      "version": "1.2.0",
+      "assets": ["Merc2Fix.asi"]
+    }
+  ],
+
+  "$comment_for_modkit_devs": [
+    "Two open schema questions I'd love feedback on before this gets merged:",
+    "",
+    "1) `tools` array per mod (new). Proposed shape:",
+    "     { id, name, description, executable, requires }",
+    "   where `executable` is a path relative to the mod's install",
+    "   directory (same place `assets` are extracted). Lets a mod page",
+    "   surface a 'Launch <name>' button. `requires` is human-readable",
+    "   prerequisites — e.g. 'Game must be running'.",
+    "",
+    "2) Asset source URL. The current schema lists `assets` as filenames",
+    "   but doesn't say where to fetch them from. Both entries here ship",
+    "   the file `Merc2Fix.asi` but the bytes differ — they come from",
+    "   different release zips (Merc2Reborn-v1.2.0-full.zip vs",
+    "   Merc2Reborn-v1.2.0-multiplayer-only.zip on the GitHub Releases",
+    "   page). Either a new top-level `release_url_pattern` field, or",
+    "   per-mod `source_zip` field, or a hard convention like",
+    "   'latest release on <url>/releases, asset named",
+    "   <repo>-<version>-<slug>.zip'. Whatever you prefer.",
+    "",
+    "Future-state mod split (not in this manifest yet): the next release",
+    "is planned to split into separate `multiplayer-restore` and",
+    "`lua-bridge` ASIs that can be enabled independently, matching the",
+    "QoL framework's one-mod-per-ASI convention. Drafts for both already",
+    "live under mod-ports/mercs2-qol-mods/ in the repo. When those are",
+    "built, they'll replace the two combined entries above."
+  ]
+}
