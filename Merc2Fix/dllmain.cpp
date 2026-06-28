@@ -557,6 +557,186 @@ static OpaqueFn fpOriginal_luaL_register = nullptr;
 static lua_CFunction_t p_luaB_loadstring = nullptr;
 static lua_CFunction_t p_luaB_pcall      = nullptr;
 
+// Raw address of luaL_register (custom register ABI: ECX=L, EAX=libname,
+// [esp+4]=table, caller cleans 4 bytes). Set in LuaBridgeInitThread
+// from g_rvas->luaL_register. Invoked via inline asm in CallLuaLRegister
+// below since no standard calling convention matches.
+static void* p_luaL_register_raw = nullptr;
+
+// =====================================================================
+// Tcp.Send — expose outbound TCP-send to Lua chunks
+//
+// Registers a single Lua C function as _G.Tcp.Send so chunks running
+// through the bridge can talk to other local services (most notably
+// the debug-overlay mod on 127.0.0.1:27051). Pattern:
+//
+//   Tcp.Send("127.0.0.1", 27051, "SET fps 60")
+//
+// Returns nil on failure (bad args / connect failed), or the number
+// of bytes sent on success. Synchronous — blocks for the duration of
+// the connect+send. Fast on localhost (microseconds); not designed
+// for long-haul or large-payload use.
+//
+// Lifecycle: registered once per captured L via RegisterTcpLibOnce
+// (called from the detour path, where we know we're in a clean
+// Lua dispatch context and L is verified valid).
+// =====================================================================
+
+static int __cdecl LuaTcpSend(lua_State* L) {
+    char* Lc = reinterpret_cast<char*>(L);
+    char* base = *reinterpret_cast<char**>(Lc + LUA_OFF_BASE);
+    char* top  = *reinterpret_cast<char**>(Lc + LUA_OFF_TOP);
+
+    auto push_nil_and_return_1 = [&]() {
+        if (SafeProbe(top, TVALUE_SIZE)) {
+            *reinterpret_cast<int*>(top + TVALUE_TT_OFFSET) = LUA_TNIL;
+            *reinterpret_cast<char**>(Lc + LUA_OFF_TOP) = top + TVALUE_SIZE;
+        }
+        return 1;
+    };
+
+    // Need at least 3 args: host, port, msg.
+    ptrdiff_t nargs_bytes = top - base;
+    if (nargs_bytes < 3 * TVALUE_SIZE) return push_nil_and_return_1();
+
+    // Arg 1: host (string)
+    int tt0 = *reinterpret_cast<int*>(base + TVALUE_TT_OFFSET);
+    if (tt0 != LUA_TSTRING) return push_nil_and_return_1();
+    char* gc0 = *reinterpret_cast<char**>(base);
+    if (!SafeProbe(gc0, 0x14)) return push_nil_and_return_1();
+    uint32_t host_len = *reinterpret_cast<uint32_t*>(gc0 + 0x0C);
+    if (host_len == 0 || host_len > 100) return push_nil_and_return_1();
+    const char* host_data = gc0 + 0x10;
+    if (!SafeProbe(host_data, host_len + 1)) return push_nil_and_return_1();
+
+    // Arg 2: port (number, lua_Number = float in this build)
+    int tt1 = *reinterpret_cast<int*>(base + TVALUE_SIZE + TVALUE_TT_OFFSET);
+    if (tt1 != LUA_TNUMBER) return push_nil_and_return_1();
+    float port_f = *reinterpret_cast<float*>(base + TVALUE_SIZE);
+    int port = static_cast<int>(port_f);
+    if (port <= 0 || port > 65535) return push_nil_and_return_1();
+
+    // Arg 3: msg (string)
+    int tt2 = *reinterpret_cast<int*>(base + 2 * TVALUE_SIZE + TVALUE_TT_OFFSET);
+    if (tt2 != LUA_TSTRING) return push_nil_and_return_1();
+    char* gc2 = *reinterpret_cast<char**>(base + 2 * TVALUE_SIZE);
+    if (!SafeProbe(gc2, 0x14)) return push_nil_and_return_1();
+    uint32_t msg_len = *reinterpret_cast<uint32_t*>(gc2 + 0x0C);
+    if (msg_len > 64 * 1024) return push_nil_and_return_1();
+    const char* msg_data = gc2 + 0x10;
+    if (!SafeProbe(msg_data, msg_len + 1)) return push_nil_and_return_1();
+
+    // Copy host into a NUL-terminated buffer for inet_pton / getaddrinfo.
+    char host_buf[128];
+    memcpy(host_buf, host_data, host_len);
+    host_buf[host_len] = '\0';
+
+    // Build outgoing buffer: msg + '\n' so receivers using line-framed
+    // protocols (like debug-overlay) get a complete command per Send.
+    std::string out;
+    out.reserve(msg_len + 1);
+    out.append(msg_data, msg_len);
+    if (msg_len == 0 || out[out.size() - 1] != '\n') out += '\n';
+
+    int sent_total = 0;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s != INVALID_SOCKET) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(static_cast<u_short>(port));
+        if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
+            // Not a dotted-quad — try DNS.
+            ADDRINFOA hints{}, *res = nullptr;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host_buf, nullptr, &hints, &res) == 0 && res) {
+                addr.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
+                freeaddrinfo(res);
+            } else {
+                closesocket(s);
+                return push_nil_and_return_1();
+            }
+        }
+        // Short blocking timeout so a misconfigured host can't hang the
+        // game's Lua dispatch.
+        DWORD tv_ms = 1500;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+        if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            size_t off = 0;
+            while (off < out.size()) {
+                int n = send(s, out.c_str() + off, static_cast<int>(out.size() - off), 0);
+                if (n <= 0) break;
+                off += static_cast<size_t>(n);
+                sent_total += n;
+            }
+        }
+        closesocket(s);
+    }
+
+    // Push (float)sent_total as the single return value.
+    if (SafeProbe(top, TVALUE_SIZE)) {
+        *reinterpret_cast<float*>(top) = static_cast<float>(sent_total);
+        *reinterpret_cast<int*>(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;
+        *reinterpret_cast<char**>(Lc + LUA_OFF_TOP) = top + TVALUE_SIZE;
+    }
+    return 1;
+}
+
+// Static luaL_Reg table registered into _G.Tcp.
+static const LuaLReg_Entry kTcpLib[] = {
+    { "Send", reinterpret_cast<void*>(&LuaTcpSend) },
+    { nullptr, nullptr },
+};
+
+// Invoke luaL_register with its custom ABI from C++. The standard
+// luaL_register signature is `void luaL_register(L, libname, reg)` but
+// Pandemic's build expects ECX=L, EAX=libname, [esp+4]=reg, with the
+// caller cleaning 4 bytes. MSVC inline asm wraps it cleanly.
+static void CallLuaLRegister(void* L, const char* libname, const LuaLReg_Entry* reg) {
+    if (!p_luaL_register_raw) return;
+    __asm {
+        mov ecx, L
+        mov eax, libname
+        push reg
+        call dword ptr [p_luaL_register_raw]
+        add esp, 4
+    }
+}
+
+// Register _G.Tcp = { Send = LuaTcpSend } exactly once per L. The
+// engine has two visible Ls (frontend + gameplay); we register on
+// each independently so chunks running on either VM can use Tcp.Send.
+//
+// Must be called from within a known Lua dispatch context (i.e. from
+// one of the detours, with arg0 as L) so the register call's stack
+// manipulation lands on a sane frame.
+static void RegisterTcpLibOnce(void* L) {
+    if (!L || !p_luaL_register_raw) return;
+    // Per-L dedupe — same shape as CaptureL's seen array.
+    static std::atomic<void*> registered_for[8]{};
+    for (int i = 0; i < 8; ++i) {
+        void* slot = registered_for[i].load(std::memory_order_acquire);
+        if (slot == L) return;  // already registered for this L
+        if (slot == nullptr) {
+            void* expected = nullptr;
+            if (registered_for[i].compare_exchange_strong(expected, L)) {
+                break;  // we own this slot, proceed
+            }
+            // CAS lost — re-check this slot or move on
+            if (registered_for[i].load(std::memory_order_acquire) == L) return;
+        }
+    }
+    // CallLuaLRegister manipulates L's stack; do it under the same
+    // re-entry guard as the executor so a fired pump detour can't
+    // race into us.
+    if (g_inBridgeExec) return;
+    g_inBridgeExec = true;
+    CallLuaLRegister(L, "Tcp", kTcpLib);
+    g_inBridgeExec = false;
+    Log("[+] Tcp.Send registered into _G.Tcp on L=%p", L);
+}
+
 // Byte-crafted TString to push the chunk source onto L's stack without
 // calling lua_pushstring (which is inlined in this build). Layout
 // matches stock Lua 5.1.2 (sizeof(TString) = 16 bytes, data follows).
@@ -1340,6 +1520,10 @@ static int __cdecl DetourLuaType(lua_State* L) {
     static std::atomic_bool seen{false};
     DetourDiag("DetourLuaType", L, seen);
     CaptureL(L, "type");
+    /* Lua dispatch gave us L → safe to invoke luaL_register here.
+     * Per-L dedupe inside the call, so this is essentially free
+     * after the first observation. */
+    RegisterTcpLibOnce(L);
 
     // One-shot: when type() is called with a string arg, dump the
     // engine's TValue + the TString it points to. Gives us a verified
@@ -1562,7 +1746,8 @@ static DWORD WINAPI LuaBridgeInitThread(LPVOID) {
     // executor in LuaDoString() uses these to compile+run user chunks,
     // but ONLY when invoked from a verified Lua context (currently
     // DetourLuaType — see PumpQueue(L) calls in each detour).
-    p_luaB_loadstring = reinterpret_cast<lua_CFunction_t>(base + g_rvas->luaB_loadstring);
+    p_luaB_loadstring   = reinterpret_cast<lua_CFunction_t>(base + g_rvas->luaB_loadstring);
+    p_luaL_register_raw = reinterpret_cast<void*>(base + g_rvas->luaL_register);
     p_luaB_pcall      = reinterpret_cast<lua_CFunction_t>(base + g_rvas->luaB_pcall);
     InitChunkSource();
     Log("[*] LuaBridge: Phase 3 executor armed (loadstring=%p, pcall=%p, chunkbuf=%p)",
