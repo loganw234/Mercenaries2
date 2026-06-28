@@ -15,7 +15,7 @@ STRIP_MINGW = i686-w64-mingw32-strip
 
 TARGET      = lua_bridge.asi
 SRC         = lua_bridge.c
-CFLAGS      = -O2 -Wall -Wno-unused-function -Wno-unused-variable -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
+CFLAGS      = -O2 -Wall -Wno-unused-function -Wno-unused-variable -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS     = -lws2_32 -lkernel32 -luser32
 
 # If the luaL_register hijack is added later via a global assembly

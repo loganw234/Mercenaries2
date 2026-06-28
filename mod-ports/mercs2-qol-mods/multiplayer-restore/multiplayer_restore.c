@@ -135,25 +135,32 @@ static const BYTE kFeslCAKeyPayload[128] = {
 
 static char g_server_ip[64]  = "refesl.live";  /* overridden by INI */
 static int  g_spoof_clock    = 1;              /* overridden by INI */
+static int  g_hook_dns       = 1;              /* overridden by INI */
+static int  g_hook_cert      = 1;              /* overridden by INI */
+static int  g_patch_ca       = 1;              /* overridden by INI */
 static HMODULE g_hModule     = NULL;
 
 /* ------------------------------------------------------------------------ *
- * INI config — minimal: server IP + clock spoof on/off.
+ * INI config — server IP + clock spoof + hook toggles.
  * ------------------------------------------------------------------------ */
 
 /* m2_ini_parse's callback signature is (ud, key, value) — the parser
  * strips section headers internally and never surfaces them, so we
- * dispatch on the key name alone. Our two keys (`ip` and
- * `spoof_clock`) are unique across the sections in the INI, so this
- * is fine. */
+ * dispatch on the key name alone. */
 static void OnIniKV(void* ud, const char* key, const char* value) {
     (void)ud;
     if (!key || !value) return;
     if (_stricmp(key, "ip") == 0) {
         strncpy(g_server_ip, value, sizeof(g_server_ip) - 1);
         g_server_ip[sizeof(g_server_ip) - 1] = 0;
-    } else if (_stricmp(key, "spoof_clock") == 0) {
+    } else if (_stricmp(key, "spoof_clock") == 0 || _stricmp(key, "hook_time") == 0) {
         g_spoof_clock = m2_ini_bool(value);
+    } else if (_stricmp(key, "hook_dns") == 0) {
+        g_hook_dns = m2_ini_bool(value);
+    } else if (_stricmp(key, "hook_cert") == 0) {
+        g_hook_cert = m2_ini_bool(value);
+    } else if (_stricmp(key, "patch_ca") == 0) {
+        g_patch_ca = m2_ini_bool(value);
     }
 }
 
@@ -395,22 +402,34 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     (void)arg;
 
     LoadConfig();
-    ResolveServer();
+    if (g_hook_dns) {
+        ResolveServer();
+    } else {
+        m2_logf("[*] DNS resolution skipped (DNS redirect disabled)");
+    }
 
     if (!m2_hook_init()) {
         m2_logf("[!] m2_hook_init failed; aborting");
         return 1;
     }
 
-    /* 1. DNS redirect (required). */
-    HookApi("ws2_32.dll", "gethostbyname",   (void*)d_gethostbyname,   (void**)&o_gethostbyname,   1);
-    HookApi("ws2_32.dll", "getaddrinfo",     (void*)d_getaddrinfo,     (void**)&o_getaddrinfo,     1);
-    HookApi("ws2_32.dll", "GetAddrInfoW",    (void*)d_getaddrinfow,    (void**)&o_getaddrinfow,    1);
+    /* 1. DNS redirect. */
+    if (g_hook_dns) {
+        HookApi("ws2_32.dll", "gethostbyname",   (void*)d_gethostbyname,   (void**)&o_gethostbyname,   1);
+        HookApi("ws2_32.dll", "getaddrinfo",     (void*)d_getaddrinfo,     (void**)&o_getaddrinfo,     1);
+        HookApi("ws2_32.dll", "GetAddrInfoW",    (void*)d_getaddrinfow,    (void**)&o_getaddrinfow,    1);
+    } else {
+        m2_logf("[*] DNS redirect hook disabled by config");
+    }
 
-    /* 2. Cert blob blindfold (required). */
-    HookApi("wintrust.dll", "WinVerifyTrust", (void*)d_winverifytrust, (void**)&o_winverifytrust, 1);
+    /* 2. Cert blob blindfold. */
+    if (g_hook_cert) {
+        HookApi("wintrust.dll", "WinVerifyTrust", (void*)d_winverifytrust, (void**)&o_winverifytrust, 1);
+    } else {
+        m2_logf("[*] WinVerifyTrust hook disabled by config");
+    }
 
-    /* 3. Time spoof (optional). */
+    /* 3. Time spoof. */
     if (g_spoof_clock) {
         HookApi("kernel32.dll", "GetSystemTime",            (void*)d_GetSystemTime,            (void**)&o_GetSystemTime,            1);
         HookApi("kernel32.dll", "GetLocalTime",             (void*)d_GetLocalTime,             (void**)&o_GetLocalTime,             1);
@@ -428,7 +447,11 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
 
     /* 4. FESL CA pubkey patch — runs after hooks so any logging from
      *    the wait loop goes through the live logger. */
-    PatchFeslCAKey();
+    if (g_patch_ca) {
+        PatchFeslCAKey();
+    } else {
+        m2_logf("[*] FESL CA key patch disabled by config");
+    }
 
     m2_logf("[*] multiplayer-restore: armed. Server target = %s", g_resolved_ip);
     return 0;

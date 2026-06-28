@@ -12,7 +12,7 @@ STRIP_MINGW = i686-w64-mingw32-strip
 
 TARGET      = dev_cheat_menu.asi
 SRC         = dev_cheat_menu.c
-CFLAGS      = -O2 -Wall -Wno-unused-function -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
+CFLAGS      = -O2 -Wall -Wno-unused-function -static-libgcc -shared -Wl,--enable-stdcall-fixup $(M2_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS     = -lws2_32 -lkernel32 -luser32
 
 .PHONY: all clean mingw help
