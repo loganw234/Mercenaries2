@@ -32,8 +32,23 @@ jobs:
           cd mod-ports/mercs2-qol-mods
           zip -j ../../dist/debug-overlay.zip        debug-overlay/debug_overlay.asi         debug-overlay/debug_overlay.ini
           zip -j ../../dist/dev-cheat-menu.zip       dev-cheat-menu/dev_cheat_menu.asi       dev-cheat-menu/dev_cheat_menu.ini
-          zip -j ../../dist/lua-bridge.zip           lua-bridge/lua_bridge.asi               lua-bridge/lua_bridge.ini               lua-bridge/lua_console.exe
           zip -j ../../dist/multiplayer-restore.zip  multiplayer-restore/multiplayer_restore.asi  multiplayer-restore/multiplayer_restore.ini
+          
+          # Stage and package lua-bridge with its folders
+          mkdir -p lua-bridge-pkg/OnBoot
+          mkdir -p lua-bridge-pkg/OnLoad
+          mkdir -p lua-bridge-pkg/OnKey
+          cp lua-bridge/lua_bridge.asi lua-bridge-pkg/
+          cp lua-bridge/lua_bridge.ini lua-bridge-pkg/
+          cp lua-bridge/lua_loader.ini lua-bridge-pkg/
+          cp lua-bridge/lua_console.exe lua-bridge-pkg/ 2>/dev/null || true
+          cp lua-bridge/scripts/OnBoot/print_boot.lua lua-bridge-pkg/OnBoot/ 2>/dev/null || true
+          cp lua-bridge/scripts/OnLoad/print_load.lua lua-bridge-pkg/OnLoad/ 2>/dev/null || true
+          cp lua-bridge/scripts/OnKey/test_key.lua lua-bridge-pkg/OnKey/ 2>/dev/null || true
+          cd lua-bridge-pkg
+          zip -r ../../../dist/lua-bridge.zip .
+          cd ..
+          rm -rf lua-bridge-pkg
 
       - name: Create release
         uses: softprops/action-gh-release@v2

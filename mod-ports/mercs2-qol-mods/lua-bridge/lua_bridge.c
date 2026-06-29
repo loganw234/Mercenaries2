@@ -60,9 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "m2_log.h"
-#include "m2_hook.h"
-#include "m2_ini.h"
+#include "m2.h"
 
 /* Compatibility shim: the upstream Merc2Fix uses MSVC's safe-string
  * extensions (_snprintf_s with _TRUNCATE, strncpy_s, strcpy_s).
@@ -367,6 +365,10 @@ static MOD_THREAD BOOL t_inBridgeExec = FALSE;
 /* Configuration (loaded from lua_bridge.ini). */
 static char  g_repl_host[64] = "127.0.0.1";
 static int   g_repl_port     = 27050;
+static int   g_loader_enabled  = 1;
+static int   g_loader_onboot   = 1;
+static int   g_loader_onload   = 1;
+static int   g_loader_delay_ms = 50;
 
 /* ------------------------------------------------------------------------ *
  * Output-buffer helpers
@@ -671,7 +673,21 @@ static void PumpQueue(void* L_for_exec) {
     }
 }
 
+static volatile LONG g_OnLoadTriggered = 0;
+static volatile LONG g_OnLoadExecuted = 0;
+
+static void RegisterTcpLib(void* L);
+static void ExecuteLuaFolder(void* L, const char* folder_name);
+static void InitializeKeyScripts(void);
+
 static __inline void GatedPump(void* L_arg0) {
+    if (g_loader_enabled && g_loader_onload && g_OnLoadTriggered && !g_OnLoadExecuted) {
+        if (LooksLikeLuaState(L_arg0)) {
+            g_OnLoadExecuted = 1;
+            ExecuteLuaFolder(L_arg0, "OnLoad");
+        }
+    }
+
     if (g_PendingScripts <= 0) return;
     if (t_inBridgeExec)        return;
     if (!LooksLikeLuaState(L_arg0)) return;
@@ -698,6 +714,23 @@ static void CaptureL(void* L, const char* via) {
         if (seen[i] == NULL) {
             seen[i] = L;
             m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
+            RegisterTcpLib(L);
+
+            if (g_loader_enabled) {
+                static int key_loader_initialized = 0;
+                if (!key_loader_initialized) {
+                    key_loader_initialized = 1;
+                    InitializeKeyScripts();
+                }
+            }
+
+            if (g_loader_enabled && g_loader_onboot) {
+                static int onboot_executed = 0;
+                if (!onboot_executed) {
+                    onboot_executed = 1;
+                    ExecuteLuaFolder(L, "OnBoot");
+                }
+            }
             return;
         }
     }
@@ -708,6 +741,15 @@ static void CaptureL(void* L, const char* via) {
  * Detours
  * ------------------------------------------------------------------------ */
 static int __cdecl DetourNoopStub(void* L) {
+    if (g_loader_enabled && g_loader_onload && !g_OnLoadTriggered) {
+        char msg[512];
+        if (m2_lua_join_strings(L, msg, sizeof(msg)) >= 1) {
+            if (strstr(msg, "GlobalExit - Complete")) {
+                m2_logf("[*] lua_bridge: OnLoad milestone reached (GlobalExit - Complete). Queuing OnLoad scripts.");
+                InterlockedExchange(&g_OnLoadTriggered, 1);
+            }
+        }
+    }
     GatedPump(L);
     return fpOriginal_NoopStub ? fpOriginal_NoopStub(L) : 0;
 }
@@ -797,6 +839,458 @@ static int __cdecl HijackedToString(void* L) {
  * ======================================================================== */
 
 /* ------------------------------------------------------------------------ *
+ * Expose Tcp.Send to Lua
+ * ------------------------------------------------------------------------ */
+typedef struct luaL_Reg {
+    const char *name;
+    int (__cdecl *func)(void* L);
+} luaL_Reg;
+
+static int LuaTcpSend(void* L) {
+    char host[128];
+    char msg[2048];
+    int port;
+
+    if (m2_lua_nargs(L) < 3) return 0;
+    if (m2_lua_arg_string(L, 0, host, sizeof(host)) == 0) return 0;
+    
+    // Port is standard Lua float, extract from stack base:
+    char* base = *(char**)((char*)L + 0x0C); // L->base
+    if (!base) return 0;
+    float port_val = *(float*)(base + 8);    // First stack slot (8 bytes per TValue)
+    port = (int)port_val;
+
+    if (m2_lua_arg_string(L, 2, msg, sizeof(msg)) == 0) return 0;
+
+    unsigned long ip = inet_addr(host);
+    if (ip == INADDR_NONE) return 0;
+
+    /*
+     * SECURITY RESTRICTION:
+     * Only allow connections to loopback/localhost (127.0.0.0/8).
+     * This decision was made for player security, preventing malicious or
+     * untrusted Lua scripts from performing port scans on the player's
+     * local network or exfiltrating data to external servers on the internet.
+     *
+     * NOTE: If this restriction is removed, it could potentially allow
+     * secondary out-of-band communication between coop players to sync
+     * mod status over the network without needing to integrate directly
+     * with the game's built-in P2P networking core.
+     */
+    unsigned long ip_host = ntohl(ip);
+    if ((ip_host & 0xFF000000) != 0x7F000000) {
+        return 0; // Block non-localhost destinations
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s != INVALID_SOCKET) {
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = ip;
+
+        DWORD timeout = 500;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+        
+        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            send(s, msg, (int)strlen(msg), 0);
+        }
+        closesocket(s);
+    }
+    return 0;
+}
+
+static const luaL_Reg tcp_lib[] = {
+    {"Send", LuaTcpSend},
+    {NULL, NULL}
+};
+
+/* ------------------------------------------------------------------------ *
+ * Native Lua Script Loader
+ * ------------------------------------------------------------------------ */
+#define MAX_SCRIPTS 128
+
+typedef struct {
+    char path[MAX_PATH];
+    char rel_path[MAX_PATH];
+    int load_order;
+} LuaScriptFile;
+
+static int CompareAlphabetical(const void* a, const void* b) {
+    return _stricmp(((const LuaScriptFile*)a)->rel_path, ((const LuaScriptFile*)b)->rel_path);
+}
+
+static int CompareLoadOrder(const void* a, const void* b) {
+    int diff = ((const LuaScriptFile*)a)->load_order - ((const LuaScriptFile*)b)->load_order;
+    if (diff != 0) return diff;
+    return _stricmp(((const LuaScriptFile*)a)->rel_path, ((const LuaScriptFile*)b)->rel_path);
+}
+
+static void EnsureLoaderDirectories(void) {
+    char exe_dir[MAX_PATH];
+    char path[MAX_PATH];
+    char* slash;
+
+    GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+    slash = strrchr(exe_dir, '\\');
+    if (slash) *(slash + 1) = '\0';
+
+    snprintf(path, sizeof(path), "%sscripts", exe_dir);
+    CreateDirectoryA(path, NULL);
+
+    snprintf(path, sizeof(path), "%sscripts\\OnBoot", exe_dir);
+    CreateDirectoryA(path, NULL);
+
+    snprintf(path, sizeof(path), "%sscripts\\OnLoad", exe_dir);
+    CreateDirectoryA(path, NULL);
+
+    snprintf(path, sizeof(path), "%sscripts\\OnKey", exe_dir);
+    CreateDirectoryA(path, NULL);
+}
+
+static void CollectScriptsRecursive(const char* base_path, const char* sub_path, LuaScriptFile* list, int* count, int max_count) {
+    char search_path[MAX_PATH];
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind;
+
+    snprintf(search_path, sizeof(search_path), "%s%s*", base_path, sub_path);
+    hFind = FindFirstFileA(search_path, &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) {
+            continue;
+        }
+
+        char relative_path[MAX_PATH];
+        if (sub_path[0] == '\0') {
+            snprintf(relative_path, sizeof(relative_path), "%s", ffd.cFileName);
+        } else {
+            snprintf(relative_path, sizeof(relative_path), "%s%s", sub_path, ffd.cFileName);
+        }
+
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            char next_sub[MAX_PATH];
+            snprintf(next_sub, sizeof(next_sub), "%s\\", relative_path);
+            CollectScriptsRecursive(base_path, next_sub, list, count, max_count);
+        } else {
+            size_t len = strlen(ffd.cFileName);
+            if (len > 4 && _stricmp(ffd.cFileName + len - 4, ".lua") == 0) {
+                if (*count < max_count) {
+                    snprintf(list[*count].path, sizeof(list[*count].path), "%s%s", base_path, relative_path);
+                    
+                    strncpy(list[*count].rel_path, relative_path, sizeof(list[*count].rel_path) - 1);
+                    list[*count].rel_path[sizeof(list[*count].rel_path) - 1] = '\0';
+                    
+                    list[*count].load_order = -1;
+                    (*count)++;
+                }
+            }
+        }
+    } while (FindNextFileA(hFind, &ffd) != 0);
+
+    FindClose(hFind);
+}
+
+static void EnsureLoaderIniHeader(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (f) {
+        fclose(f);
+        return; // File already exists
+    }
+    
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "; lua_loader.ini — Lua Script Loader Configuration\n");
+        fprintf(f, "; Define execution order for [OnBoot] and [OnLoad] (lowest numbers load first)\n");
+        fprintf(f, "; Define hotkey triggers under [OnKey] (e.g. script.lua = F1 or script.lua = insert)\n");
+        fprintf(f, ";\n");
+        fprintf(f, "; Virtual Key codes reference: https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes\n");
+        fprintf(f, "; Common keys: insert, delete, home, end, pageup, pagedown, space, enter, escape, F1..F12, A..Z, 0..9\n\n");
+        fclose(f);
+    }
+}
+
+static void ExtractDefaultKey(const char* file_path, char* out_key, size_t out_max) {
+    strncpy(out_key, "unassigned", out_max);
+    FILE* f = fopen(file_path, "r");
+    if (!f) return;
+    
+    char line[256];
+    int i;
+    for (i = 0; i < 10; ++i) {
+        if (!fgets(line, sizeof(line), f)) break;
+        char* p = strstr(line, "KEYVAL");
+        if (p) {
+            char* eq = strchr(p, '=');
+            if (eq) {
+                char* q1 = strchr(eq, '"');
+                if (!q1) q1 = strchr(eq, '\'');
+                if (q1) {
+                    q1++;
+                    char* q2 = strchr(q1, '"');
+                    if (!q2) q2 = strchr(q1, '\'');
+                    if (q2 && (size_t)(q2 - q1) < out_max) {
+                        size_t len = q2 - q1;
+                        memcpy(out_key, q1, len);
+                        out_key[len] = '\0';
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
+static int ResolveKeyName(const char* name) {
+    if (!name) return 0;
+    if (_stricmp(name, "unassigned") == 0) return 0;
+
+    if (name[0] != '\0' && name[1] == '\0') {
+        char c = name[0];
+        if (c >= 'a' && c <= 'z') return 0x41 + (c - 'a');
+        if (c >= 'A' && c <= 'Z') return 0x41 + (c - 'A');
+        if (c >= '0' && c <= '9') return 0x30 + (c - '0');
+    }
+
+    if ((name[0] == 'f' || name[0] == 'F') && name[1] >= '1' && name[1] <= '9') {
+        int num = atoi(name + 1);
+        if (num >= 1 && num <= 12) return 0x70 + (num - 1);
+    }
+
+    if (_stricmp(name, "insert") == 0) return VK_INSERT;
+    if (_stricmp(name, "delete") == 0) return VK_DELETE;
+    if (_stricmp(name, "home") == 0) return VK_HOME;
+    if (_stricmp(name, "end") == 0) return VK_END;
+    if (_stricmp(name, "pageup") == 0) return VK_PRIOR;
+    if (_stricmp(name, "pagedown") == 0) return VK_NEXT;
+    if (_stricmp(name, "space") == 0) return VK_SPACE;
+    if (_stricmp(name, "enter") == 0 || _stricmp(name, "return") == 0) return VK_RETURN;
+    if (_stricmp(name, "escape") == 0 || _stricmp(name, "esc") == 0) return VK_ESCAPE;
+    if (_stricmp(name, "backspace") == 0) return VK_BACK;
+    if (_stricmp(name, "tab") == 0) return VK_TAB;
+    if (_stricmp(name, "shift") == 0) return VK_SHIFT;
+    if (_stricmp(name, "ctrl") == 0 || _stricmp(name, "control") == 0) return VK_CONTROL;
+    if (_stricmp(name, "alt") == 0) return VK_MENU;
+    if (_stricmp(name, "left") == 0) return VK_LEFT;
+    if (_stricmp(name, "up") == 0) return VK_UP;
+    if (_stricmp(name, "right") == 0) return VK_RIGHT;
+    if (_stricmp(name, "down") == 0) return VK_DOWN;
+
+    return 0;
+}
+
+static void ExecuteLuaFolder(void* L, const char* folder_name) {
+    char exe_dir[MAX_PATH];
+    char folder_path[MAX_PATH];
+    char loader_ini_path[MAX_PATH];
+    char* slash;
+    LuaScriptFile scripts[MAX_SCRIPTS];
+    int script_count = 0;
+    int i;
+
+    GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+    slash = strrchr(exe_dir, '\\');
+    if (slash) *(slash + 1) = '\0';
+
+    snprintf(folder_path, sizeof(folder_path), "%sscripts\\%s\\", exe_dir, folder_name);
+    m2_module_path(g_hModule, "lua_loader.ini", loader_ini_path, sizeof(loader_ini_path));
+    EnsureLoaderIniHeader(loader_ini_path);
+
+    CollectScriptsRecursive(folder_path, "", scripts, &script_count, MAX_SCRIPTS);
+
+    if (script_count == 0) {
+        m2_logf("[*] lua_bridge: No scripts found in scripts/%s/", folder_name);
+        return;
+    }
+
+    qsort(scripts, script_count, sizeof(LuaScriptFile), CompareAlphabetical);
+
+    for (i = 0; i < script_count; ++i) {
+        int order = GetPrivateProfileIntA(folder_name, scripts[i].rel_path, -1, loader_ini_path);
+        if (order == -1) {
+            order = (i + 1) * 10;
+            char order_str[32];
+            snprintf(order_str, sizeof(order_str), "%d", order);
+            WritePrivateProfileStringA(folder_name, scripts[i].rel_path, order_str, loader_ini_path);
+        }
+        scripts[i].load_order = order;
+    }
+
+    qsort(scripts, script_count, sizeof(LuaScriptFile), CompareLoadOrder);
+
+    for (i = 0; i < script_count; ++i) {
+        FILE* f = fopen(scripts[i].path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+
+            if (sz > 0 && sz < 1024 * 1024) { // Max 1MB
+                char* buf = (char*)malloc(sz + 1);
+                if (buf) {
+                    size_t read_bytes = fread(buf, 1, sz, f);
+                    buf[read_bytes] = '\0';
+
+                    m2_logf("[*] lua_bridge: Loading script (%s): %s (%ld bytes)", folder_name, scripts[i].rel_path, sz);
+                    
+                    char result_buf[4096];
+                    t_inBridgeExec = TRUE;
+                    LuaDoString(L, buf, read_bytes, result_buf, sizeof(result_buf));
+                    t_inBridgeExec = FALSE;
+                    
+                    m2_logf("[+] lua_bridge: Script result: %s", result_buf);
+
+                    free(buf);
+                }
+            }
+            fclose(f);
+        } else {
+            m2_logf("[!] lua_bridge: Failed to open script: %s", scripts[i].path);
+        }
+
+        if (g_loader_delay_ms > 0 && i < script_count - 1) {
+            Sleep(g_loader_delay_ms);
+        }
+    }
+}
+
+typedef struct {
+    char path[MAX_PATH];
+    char rel_path[MAX_PATH];
+    char key_name[64];
+    int vk_code;
+    int was_down;
+} LuaKeyScript;
+
+static LuaKeyScript g_KeyScripts[MAX_SCRIPTS];
+static int g_KeyScriptCount = 0;
+
+static DWORD WINAPI LoaderKeyThread(LPVOID param) {
+    (void)param;
+    for (;;) {
+        int i;
+        for (i = 0; i < g_KeyScriptCount; ++i) {
+            int vk = g_KeyScripts[i].vk_code;
+            if (vk > 0 && vk < 256) {
+                int is_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (is_down) {
+                    if (!g_KeyScripts[i].was_down) {
+                        g_KeyScripts[i].was_down = 1;
+                        
+                        // Load script file and queue it
+                        FILE* f = fopen(g_KeyScripts[i].path, "rb");
+                        if (f) {
+                            fseek(f, 0, SEEK_END);
+                            long sz = ftell(f);
+                            fseek(f, 0, SEEK_SET);
+                            
+                            if (sz > 0 && sz < 1024 * 1024) {
+                                char* buf = (char*)malloc(sz + 1);
+                                if (buf) {
+                                    size_t read_bytes = fread(buf, 1, sz, f);
+                                    buf[read_bytes] = '\0';
+                                    
+                                    m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s", 
+                                            g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
+                                    InQueuePush(buf, read_bytes);
+                                    
+                                    free(buf);
+                                }
+                            }
+                            fclose(f);
+                        }
+                    }
+                } else {
+                    g_KeyScripts[i].was_down = 0;
+                }
+            }
+        }
+        Sleep(33); // 30Hz polling rate
+    }
+    return 0;
+}
+
+static void InitializeKeyScripts(void) {
+    char exe_dir[MAX_PATH];
+    char folder_path[MAX_PATH];
+    char loader_ini_path[MAX_PATH];
+    char* slash;
+    int i;
+    
+    GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+    slash = strrchr(exe_dir, '\\');
+    if (slash) *(slash + 1) = '\0';
+
+    snprintf(folder_path, sizeof(folder_path), "%sscripts\\OnKey\\", exe_dir);
+    m2_module_path(g_hModule, "lua_loader.ini", loader_ini_path, sizeof(loader_ini_path));
+    EnsureLoaderIniHeader(loader_ini_path);
+
+    LuaScriptFile temp_files[MAX_SCRIPTS];
+    int file_count = 0;
+    CollectScriptsRecursive(folder_path, "", temp_files, &file_count, MAX_SCRIPTS);
+
+    g_KeyScriptCount = 0;
+
+    if (file_count == 0) {
+        m2_logf("[*] lua_bridge: No scripts found in scripts/OnKey/");
+        return;
+    }
+
+    qsort(temp_files, file_count, sizeof(LuaScriptFile), CompareAlphabetical);
+
+    for (i = 0; i < file_count && g_KeyScriptCount < MAX_SCRIPTS; ++i) {
+        char key_name[64];
+        
+        GetPrivateProfileStringA("OnKey", temp_files[i].rel_path, "", key_name, sizeof(key_name), loader_ini_path);
+        
+        if (key_name[0] == '\0') {
+            ExtractDefaultKey(temp_files[i].path, key_name, sizeof(key_name));
+            WritePrivateProfileStringA("OnKey", temp_files[i].rel_path, key_name, loader_ini_path);
+        }
+
+        strncpy(g_KeyScripts[g_KeyScriptCount].path, temp_files[i].path, sizeof(g_KeyScripts[g_KeyScriptCount].path) - 1);
+        g_KeyScripts[g_KeyScriptCount].path[sizeof(g_KeyScripts[g_KeyScriptCount].path) - 1] = '\0';
+
+        strncpy(g_KeyScripts[g_KeyScriptCount].rel_path, temp_files[i].rel_path, sizeof(g_KeyScripts[g_KeyScriptCount].rel_path) - 1);
+        g_KeyScripts[g_KeyScriptCount].rel_path[sizeof(g_KeyScripts[g_KeyScriptCount].rel_path) - 1] = '\0';
+
+        strncpy(g_KeyScripts[g_KeyScriptCount].key_name, key_name, sizeof(g_KeyScripts[g_KeyScriptCount].key_name) - 1);
+        g_KeyScripts[g_KeyScriptCount].key_name[sizeof(g_KeyScripts[g_KeyScriptCount].key_name) - 1] = '\0';
+
+        g_KeyScripts[g_KeyScriptCount].vk_code = ResolveKeyName(key_name);
+        g_KeyScripts[g_KeyScriptCount].was_down = 0;
+
+        m2_logf("[*] lua_bridge: Registered OnKey script: scripts/OnKey/%s bound to '%s' (VK 0x%X)", 
+                temp_files[i].rel_path, key_name, g_KeyScripts[g_KeyScriptCount].vk_code);
+
+        g_KeyScriptCount++;
+    }
+
+    CreateThread(NULL, 0, LoaderKeyThread, NULL, 0, NULL);
+    m2_logf("[*] lua_bridge: Spawning background hotkey polling thread");
+}
+
+static void RegisterTcpLib(void* L) {
+    HMODULE base = GetModuleHandleA(NULL);
+    if (!base) return;
+    DWORD func_addr = (DWORD)base + g_rvas->luaL_register;
+    const char* libname = "Tcp";
+    const luaL_Reg* table = tcp_lib;
+
+    __asm__ volatile (
+        "push %2\n\t"        // Push table pointer (stack arg)
+        "call *%3\n\t"       // Call luaL_register
+        "add $4, %%esp\n\t"  // Clean stack (4 bytes)
+        :
+        : "c"(L), "a"(libname), "r"(table), "r"(func_addr)
+        : "edx", "memory"
+    );
+    m2_logf("[*] lua_bridge: Registered Tcp.Send globally");
+}
+
+/* ------------------------------------------------------------------------ *
  * TCP REPL server
  *
  * Protocol (matches tools/lua_repl.py and tools/lua_console.py in the
@@ -856,7 +1350,6 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
 
         c = accept(srv, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
-        m2_logf("[+] lua_bridge: client connected");
 
         for (;;) {
             /* Flush pending output */
@@ -926,7 +1419,6 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
         }
 
         closesocket(c);
-        m2_logf("[-] lua_bridge: client disconnected");
     }
 }
 
@@ -946,6 +1438,15 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
     } else if (_stricmp(key, "port") == 0) {
         g_repl_port = atoi(value);
         if (g_repl_port <= 0 || g_repl_port > 65535) g_repl_port = 27050;
+    } else if (_stricmp(key, "loader_enabled") == 0) {
+        g_loader_enabled = atoi(value);
+    } else if (_stricmp(key, "loader_onboot") == 0) {
+        g_loader_onboot = atoi(value);
+    } else if (_stricmp(key, "loader_onload") == 0) {
+        g_loader_onload = atoi(value);
+    } else if (_stricmp(key, "loader_delay_ms") == 0) {
+        g_loader_delay_ms = atoi(value);
+        if (g_loader_delay_ms < 0) g_loader_delay_ms = 0;
     }
 }
 
@@ -976,6 +1477,9 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     (void)arg;
 
     LoadConfig();
+    if (g_loader_enabled) {
+        EnsureLoaderDirectories();
+    }
     InitializeCriticalSection(&g_inMtx);
     InitializeCriticalSection(&g_outMtx);
     InitChunkSource();
