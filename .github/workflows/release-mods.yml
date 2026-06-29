@@ -1,0 +1,44 @@
+name: Release mod-ports
+
+# Triggered when you push a version tag (e.g. git tag v1.3.0 && git push --tags).
+# Also available via the Actions UI (workflow_dispatch) for ad-hoc releases.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.3.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Package each mod from the committed binaries in mod-ports/.
+      # Note: the Makefiles reference mod-ports/sdk/sdk.mk which is not yet in the
+      # repo. Once sdk.mk is added, replace this step with `make -C mod-ports/mercs2-qol-mods/<mod>`
+      # per mod and let CI build from source.
+      - name: Package mods
+        run: |
+          mkdir dist
+          cd mod-ports/mercs2-qol-mods
+          zip -j ../../dist/debug-overlay.zip        debug-overlay/debug_overlay.asi         debug-overlay/debug_overlay.ini
+          zip -j ../../dist/dev-cheat-menu.zip       dev-cheat-menu/dev_cheat_menu.asi       dev-cheat-menu/dev_cheat_menu.ini
+          zip -j ../../dist/lua-bridge.zip           lua-bridge/lua_bridge.asi               lua-bridge/lua_bridge.ini               lua-bridge/lua_console.exe
+          zip -j ../../dist/multiplayer-restore.zip  multiplayer-restore/multiplayer_restore.asi  multiplayer-restore/multiplayer_restore.ini
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          name: ${{ github.ref_name || inputs.tag }}
+          generate_release_notes: true
+          files: dist/*.zip
