@@ -851,6 +851,21 @@ static void LoadConfig(void) {
 static DWORD WINAPI WorkerThread(LPVOID arg) {
     (void)arg;
 
+    /* Check if dxwrapper.dll is loaded in the process space.
+     * The Debug Overlay mod hooks Direct3D9 vtable entry points to draw on the screen.
+     * If the game runs without dxwrapper wrapping D3D9, attempting to hook the naked
+     * D3D9 device directly will cause the game to crash. */
+    if (!GetModuleHandleA("dxwrapper.dll")) {
+        m2_logf("[!] debug_overlay: dxwrapper.dll not detected in process space! Disabling mod to prevent crash.");
+        MessageBoxA(NULL, 
+            "The Debug Overlay mod requires DXwrapper to be active.\n\n"
+            "Please ensure that dxwrapper.dll is installed in your game directory and loaded.\n"
+            "The mod will now disable itself to prevent the game from crashing.",
+            "Debug Overlay — DXwrapper Missing", 
+            MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
+        return 0;
+    }
+
     LoadConfig();
     InitializeCriticalSection(&g_state_mtx);
     m2_hook_init();
