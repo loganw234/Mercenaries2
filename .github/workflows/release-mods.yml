@@ -41,7 +41,8 @@ jobs:
           cp lua-bridge/lua_bridge.asi lua-bridge-pkg/
           cp lua-bridge/lua_bridge.ini lua-bridge-pkg/
           cp lua-bridge/lua_loader.ini lua-bridge-pkg/
-          cp lua-bridge/lua_console.exe lua-bridge-pkg/ 2>/dev/null || true
+          cp lua-bridge/lua_console.py lua-bridge-pkg/ 2>/dev/null || true
+          cp lua-bridge/lua_repl.py lua-bridge-pkg/ 2>/dev/null || true
           cp lua-bridge/scripts/OnBoot/print_boot.lua lua-bridge-pkg/OnBoot/ 2>/dev/null || true
           cp lua-bridge/scripts/OnLoad/print_load.lua lua-bridge-pkg/OnLoad/ 2>/dev/null || true
           cp lua-bridge/scripts/OnKey/test_key.lua lua-bridge-pkg/OnKey/ 2>/dev/null || true

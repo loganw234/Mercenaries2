@@ -16,18 +16,8 @@
       "slug": "lua-bridge",
       "name": "Lua Bridge",
       "type": "asi",
-      "description": "Exposes the game's Lua 5.1.2 runtime via a localhost TCP REPL on 127.0.0.1:27050 for runtime modding. Ships with a desktop IDE for sending Lua chunks.",
-      "assets": ["lua_bridge.asi", "lua_bridge.ini", "lua_console.exe"],
-      "tools": [
-        {
-          "id": "lua-console",
-          "name": "Lua Console",
-          "description": "Tabbed Lua IDE with syntax highlighting, persistent output panel, and live bridge status indicator. Connects to the in-game bridge on 127.0.0.1:27050.",
-          "executable": "lua_console.exe",
-          "launch_from": "mod_root",
-          "requires": "Game must be running with Lua Bridge loaded."
-        }
-      ]
+      "description": "Exposes the game's Lua 5.1.2 runtime via a localhost TCP REPL on 127.0.0.1:27050 for runtime modding. Ships with raw Python console tools.",
+      "assets": ["lua_bridge.asi", "lua_bridge.ini", "lua_console.py", "lua_repl.py"]
     },
     {
       "slug": "debug-overlay",
