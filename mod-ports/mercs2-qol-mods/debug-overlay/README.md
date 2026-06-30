@@ -127,9 +127,7 @@ it would be a one-PR follow-up.
 
 **Lua scripts via the lua-bridge mod:**
 
-The bridge needs one small addition — a `Tcp.Send(host, port, msg)`
-function exposed to the Lua state — before Lua mods can hit the
-overlay directly. Once that lands, the usage is:
+Exposes `Tcp.Send(host, port, msg)` globally inside the Lua runtime out-of-the-box. Lua scripts can send commands to the overlay directly:
 
 ```lua
 local x, y, z = Object.GetPosition(Player.GetLocalCharacter())
@@ -137,8 +135,7 @@ Tcp.Send("127.0.0.1", 27051,
          string.format("SET player_pos %.1f,%.1f,%.1f", x, y, z))
 ```
 
-A small `overlay.lua` helper wraps this into `Overlay.Set(key, value)`
-for nicer ergonomics.
+*Note: For player security, the `lua-bridge` mod restricts `Tcp.Send` connections exclusively to the localhost loopback space (`127.0.0.0/8`).*
 
 ## Status
 
