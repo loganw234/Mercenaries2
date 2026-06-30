@@ -1,5 +1,11 @@
 # Merc2Reborn
 
+> [!WARNING]
+> **This repository has been restructured and active mod development has moved to new locations:**
+> * **Experimental Mods**: For the mods developed during this phase of the project, visit [Merc2-Mods-Exp](https://github.com/loganw234/Merc2-Mods-Exp).
+> * **Community Modkit**: For the community Modkit/Mod Manager that all further mods will be built around, visit [mercs2-modkit](https://github.com/Mercenaries-Fan-Build/mercs2-modkit).
+
+
 A revival project for **Mercenaries 2: World in Flames** (2008, Pandemic
 Studios / Electronic Arts). Restores online services and exposes the
 game's statically-linked Lua 5.1.2 runtime for modding.
